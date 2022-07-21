@@ -1,0 +1,154 @@
+version: '3'
+# https://docs.bytemark.co.uk/article/wordpress-on-docker-with-phpmyadmin-ssl-via-traefik-and-automatic-updates/
+# See https://docs.docker.com/compose/overview/ for more information.
+
+# If you make changes to this file or any related files, apply them by
+# navigating to the directory that holds this file and run this as root:
+#   docker-compose down; docker-compose up -d
+
+# Create two networks: one for front-end containers that we'll make
+# publicly accessible to the internet, and one for private back-end.
+networks:
+  frontend:
+  backend:
+
+# Create persistent Docker volumes to preserve important data.
+# We don't want our data to be lost when restarting containers.
+volumes:
+  vol-wp-db:
+  vol-wp-content:
+
+
+services:
+  traefik:
+    # The latest official supported Traefik docker image
+    image: traefik:latest
+    # Enables the Traefik Dashboard and tells Traefik to listen to docker
+    # enable --log.level=INFO so we can see what Traefik is doing in the log files
+    ports:
+      # Exposes port 80 for incomming web requests
+      - "80:80"
+      - "443:443"
+    restart: always
+    networks:
+      - backend
+      - frontend  
+      # The Web UI port http://0.0.0.0:8080 (enabled by --api.insecure=true)
+#      - "8080:8080"
+    volumes:
+      # So that Traefik can listen to the Docker events
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Copies the Let's Encrypt certificate locally for ease of backing up
+      - ./letsencrypt:/letsencrypt
+       # Mounts the Traefik static configuration inside the Traefik container
+      - ./traefik.yml:/etc/traefik/traefik.yml
+    labels:
+       - "traefik.docker.network=frontend"            
+       - "traefik.enable=true"
+       - "traefik.http.routers.traefik.rule=Host(`traefik.localhost`)"
+       - "traefik.http.routers.traefik.service=traefik"
+       - "traefik.http.services.traefik.loadbalancer.server.port=8080"
+  # Watchtower detects if any linked containers have an new image
+  # available, automatically updating & restarting them if needed.
+  watchtower:
+   # https://hub.docker.com/r/centurylink/watchtower/
+    image: v2tec/watchtower:latest
+    # https://github.com/v2tec/watchtower#options
+    # This schedule applies updates (if available) at midnight.
+    command: --cleanup --schedule "0 0 0 * * *"
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      - "traefik.enable=false"
+
+  wp-db:
+    # https://hub.docker.com/_/mariadb/
+    # Specify 10.3 as we only want watchtower to apply minor updates
+    # (eg, 10.3.1) and not major updates (eg, 10.4).
+    image: mariadb:10.3
+    restart: always
+    networks:
+      - backend
+    volumes:
+      # Ensure the database persists between restarts.
+      - vol-wp-db:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${WORDPRESS_DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${WORDPRESS_DB_NAME}
+      MYSQL_USER: ${WORDPRESS_DB_USER}
+      MYSQL_PASSWORD: ${WORDPRESS_DB_PASSWORD}
+    labels:
+      - "traefik.enable=false"
+
+  # The main front-end application.
+  wp:
+    # https://hub.docker.com/_/wordpress/
+    # Replace "latest" with "4.9" to stick to a specific version.
+    image: wordpress:latest
+    depends_on:
+      - wp-db
+    restart: always
+    networks:
+      - backend
+      - frontend
+    volumes:
+      # Ensure WP themes/plugins/uploads persist between restarts.
+      - vol-wp-content:/var/www/html/wp-content
+      # Install our own php.ini, which can be customized.
+      - ./php.ini:/usr/local/etc/php/php.ini
+    environment:
+      WORDPRESS_DB_HOST: wp-db:3306
+      WORDPRESS_DB_NAME: ${WORDPRESS_DB_NAME}
+      WORDPRESS_DB_USER: ${WORDPRESS_DB_USER}
+      WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
+  
+    labels:
+       - "traefik.docker.network=frontend"            
+       - "traefik.enable=true"
+       - "traefik.http.routers.wordpress.rule=Host(`web.localhost`)"
+       - "traefik.http.routers.wordpress.service=wordpress"
+       - "traefik.http.services.wordpress.loadbalancer.server.port=80"
+            
+      # Uncomment the following line to enable HSTS header.
+      #- "traefik.frontend.headers.STSSeconds=15768000"
+
+  # Navigate to http://example.com/phpmyadmin/ to manage your MySQL
+  # databases. (Don't forget the last forward slash.) Like the Traefik
+  # dashboard, this is behind a login prompt to help you stay secure.
+  wp-phpmyadmin:
+    # https://hub.docker.com/r/phpmyadmin/phpmyadmin/
+    image: phpmyadmin/phpmyadmin:latest
+    depends_on:
+      - wp-db
+    restart: always
+    networks:
+      - backend
+      - frontend
+    volumes:
+      # Install our own php.ini, which can be customized.
+      - ./php.ini:/usr/local/etc/php/php.ini
+    environment:
+      PMA_HOST: wp-db
+      PMA_ABSOLUTE_URI: /phpmyadmin/
+      MYSQL_ROOT_PASSWORD: ${WORDPRESS_DB_ROOT_PASSWORD}
+    labels:
+      - "traefik.docker.network=frontend"
+      - "traefik.enable=true"
+      - "traefik.frontend.rule=Host:web.localhost; PathPrefixStrip:/phpmyadmin/"
+      - "traefik.port=80"
+      - "traefik.protocol=http"
+      # Remove the next line if you don't want a browser login prompt.
+      - "traefik.frontend.auth.basic=${BASIC_AUTH}"
+
+  # This allows WordPress to send email straight out of the box without
+  # having to rely on an external provider like SendGrid or MailGun.
+  # It makes an SMTP host available at the hostname "mail".
+  mail:
+    image: bytemark/smtp
+    restart: always
+    networks:
+      - frontend
+    labels:
+      - "traefik.enable=false"
+
